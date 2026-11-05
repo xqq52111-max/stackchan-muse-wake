@@ -1,0 +1,27 @@
+StackChan × Muse — wake word edition
+Copyright 2026 the StackChan-Muse contributors
+
+This work is a patch against StackChan-Muse
+(https://github.com/WillLingCom/StackChan-Muse), which is itself derived from
+the Muse Gadget SDK (https://github.com/facebookincubator/muse-gadget-sdk),
+Copyright (c) Meta Platforms, Inc. and affiliates, licensed under the Apache
+License, Version 2.0.
+
+Files added by this patch were written for this project and are likewise
+released under the Apache License, Version 2.0. Files modified keep their
+original copyright headers; the modification is noted where it is not obvious
+from the diff.
+
+Included third-party components, not covered by this licence:
+
+- esp-sr (Espressif), including the WakeNet10 model `wn10_himuse`. It is pulled
+  in as a normal component dependency and written into the `model` partition by
+  the build; no model binary is redistributed by this patch.
+- The default avatar (Jollybot) belongs to Meta and is not part of this patch.
+  The Apache License does not grant rights to that character; replace it if you
+  redistribute a build.
+
+Muse is a product of Meta Platforms, Inc. This project is not affiliated with,
+endorsed by, or supported by Meta or M5Stack. The Muse Gadget SDK is described
+by its authors as intended for personal tinkering, not a supported product or
+developer platform; the same applies here.

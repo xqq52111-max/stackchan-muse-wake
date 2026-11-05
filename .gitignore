@@ -1,0 +1,10 @@
+# never publish these
+private/
+*.cfg
+sdkconfig
+sdkconfig.old
+build-*/
+backups/
+logs/
+*.bin
+*.log

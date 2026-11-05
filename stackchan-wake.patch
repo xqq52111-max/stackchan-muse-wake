@@ -1,0 +1,1899 @@
+diff --git a/firmware/esp32/components/muse/CMakeLists.txt b/firmware/esp32/components/muse/CMakeLists.txt
+index 75ba049..c5a8076 100644
+--- a/firmware/esp32/components/muse/CMakeLists.txt
++++ b/firmware/esp32/components/muse/CMakeLists.txt
+@@ -34,6 +34,10 @@ if(CONFIG_MUSE_ENABLED)
+         "muse_input.c"
+         "muse_menu.c"
+         "muse_voice.c"
++        "muse_wake.c"
++        "muse_afe.c"
++        "muse_diag.c"
++        "muse_afe_probe.c"
+         "muse_adpcm.c"
+         "muse_settings.c"
+         "muse_settings_ui.c"
+diff --git a/firmware/esp32/components/muse/Kconfig b/firmware/esp32/components/muse/Kconfig
+index 712f1b5..7deb6fd 100644
+--- a/firmware/esp32/components/muse/Kconfig
++++ b/firmware/esp32/components/muse/Kconfig
+@@ -215,6 +215,17 @@ menu "Muse"
+             firmware image: development only. A product would call MiniMax
+             through its own proxy instead of carrying the key.
+ 
++    config MUSE_TTS_MINIMAX_URL
++        string "TTS endpoint (MiniMax T2A v2 compatible)"
++        depends on MUSE_TTS_MINIMAX
++        default "http://192.168.1.10:8880/v1/t2a_v2"
++        help
++            Where spoken replies are fetched from. The default points at the
++            local Mac TTS server (mac_tts_server.py), whose address changes with
++            DHCP, so it is a setting rather than a hard-coded URL: a wrong
++            address shows up as "can't reach MiniMax" and a silent reply with
++            the text still on screen.
++
+     config MUSE_TTS_MINIMAX_VOICE
+         string "MiniMax voice"
+         depends on MUSE_TTS_MINIMAX
+@@ -287,4 +298,45 @@ menu "Muse"
+             them. Needs PSRAM. Without it, voice notes go over Home Link's own
+             session to its paired VM and replies are shown as text.
+ 
++    config K151_WAKE_WORD
++        bool "K151 wake word (experimental)"
++        depends on MUSE_ENABLED && MUSE_BOARD_M5STACK_STACKCHAN && SPIRAM
++        default n
++        help
++            Adds the ESP-SR wake word engine to the StackChan build. Pulls in
++            espressif/esp-sr and expects a "model" data partition (2 MiB at
++            0x830000) holding the wake word model. Off by default: without it
++            nothing from ESP-SR is linked and the firmware behaves as before.
++
++
++    config K151_BENCH_NO_BT
++        bool "Bench: do not start Bluetooth"
++        depends on MUSE_ENABLED && MUSE_BOARD_M5STACK_STACKCHAN
++        default n
++        help
++            Debug builds only. Skips ble_server_start(), leaving the ~39 KB
++            Bluetooth holds free for the display's DMA buffers, so a bench
++            build with more static RAM can still boot. Phone setup stops
++            working until this is turned off again.
++
++    config K151_AFE_RESIDENT
++        bool "K151: keep the esp-sr AFE resident (experimental)"
++        depends on K151_WAKE_WORD
++        default n
++        help
++            Creates the esp-sr AFE once during boot, after the display and
++            before the radio connects, and keeps it: two microphones, noise
++            suppression, echo cancellation and its own wake word. Costs
++            ~17 KB internal RAM and ~900 KB PSRAM with
++            AFE_MEMORY_ALLOC_MORE_PSRAM. Nothing is fed to it yet; the
++            standalone WakeNet engine still does the wake word.
++
++    config K151_AFE_AEC
++        bool "K151: echo cancellation inside the AFE"
++        depends on K151_AFE_RESIDENT
++        default n
++        help
++            Keeps the AEC stage in the AFE pipeline. It needs the playback
++            reference fed as the third channel and a delay calibration to be
++            worth anything, so it is off until that work is done.
+ endmenu
+diff --git a/firmware/esp32/components/muse/idf_component.yml b/firmware/esp32/components/muse/idf_component.yml
+index 0c69579..0ef0def 100644
+--- a/firmware/esp32/components/muse/idf_component.yml
++++ b/firmware/esp32/components/muse/idf_component.yml
+@@ -15,6 +15,10 @@
+ dependencies:
+   idf:
+     version: "6.0.1"
++  espressif/esp-sr:
++    version: "2.6.1"
++    rules:
++      - if: "$CONFIG{K151_WAKE_WORD} == True"
+   espressif/cjson: "1.7.19~2"
+   lvgl/lvgl:
+     version: "9.5.0"
+diff --git a/firmware/esp32/components/muse/muse_afe.c b/firmware/esp32/components/muse/muse_afe.c
+new file mode 100644
+index 0000000..f939edd
+--- /dev/null
++++ b/firmware/esp32/components/muse/muse_afe.c
+@@ -0,0 +1,317 @@
++/*
++ * The AFE, resident: two microphones, spatial enhancement (beam forming and
++ * blind source separation) and a WebRTC voice activity detector, from esp-sr.
++ *
++ * The processing runs on its own task pinned to core 0, away from the audio and
++ * UI core: feed() and fetch() are the expensive calls, and running them inside
++ * the voice task made the animation stutter and the recording drop frames (the
++ * detector then "heard" silence and ended the turn early). The voice task only
++ * pushes raw microphone frames in and pulls enhanced frames out.
++ *
++ * Everything large lives in PSRAM (AFE_MEMORY_ALLOC_MORE_PSRAM): measured on
++ * this board, ~2 KB of internal RAM and ~390 KB of PSRAM for the two-mic
++ * pipeline, against ~49 KB internal when the allocator balances the two.
++ */
++#include "sdkconfig.h"
++
++#include <stddef.h>
++#include <stdint.h>
++
++#if CONFIG_K151_WAKE_WORD && CONFIG_K151_AFE_RESIDENT
++
++#include <stdio.h>
++#include <string.h>
++
++#include "esp_heap_caps.h"
++#include "esp_log.h"
++#include "esp_timer.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/idf_additions.h"
++#include "freertos/stream_buffer.h"
++#include "freertos/task.h"
++#include "model_path.h"
++#include "esp_afe_config.h"
++#include "esp_afe_sr_iface.h"
++#include "esp_afe_sr_models.h"
++
++#include "muse_afe.h"
++#include "muse_mem.h"
++
++static const char *TAG = "muse_afe";
++
++/* Room the rest of the firmware needs after the AFE is in. */
++#define AFE_KEEP_FREE_INT  ((size_t)12 * 1024)
++#define AFE_KEEP_BLOCK_INT ((size_t)6 * 1024)
++/* The tunnel opens only with 16 KB of DMA-capable RAM in reserve. */
++#define AFE_KEEP_FREE_DMA  ((size_t)20 * 1024)
++
++/* Raw stereo in (one second), enhanced mono out (half a second). */
++#define AFE_IN_SAMPLES  (16000 * 2)
++#define AFE_OUT_SAMPLES 8000
++
++static afe_config_t *s_cfg;
++static esp_afe_sr_data_t *s_afe;
++static void *s_models;
++static const esp_afe_sr_iface_t *s_iface;
++
++static StreamBufferHandle_t s_in;    /* interleaved stereo */
++static StreamBufferHandle_t s_out;   /* enhanced mono */
++static int16_t *s_feed;              /* one feed frame, interleaved */
++static int s_feed_chunk;
++static int s_feed_chan;
++
++#if CONFIG_K151_AFE_AEC
++/* Playback reference for the echo canceller, pushed by muse_audio_write(). */
++#define AFE_REF_SAMPLES 16384
++static int16_t *s_ref;
++static int s_ref_head, s_ref_tail;
++static volatile int64_t s_ref_last_us;
++#endif
++
++static void log_heap(const char *when)
++{
++    ESP_LOGI(TAG, "%s: int %u/%u, psram %u/%u", when,
++             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
++             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
++             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
++             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
++}
++
++static void afe_task(void *arg);
++
++esp_err_t muse_afe_start(void)
++{
++    if (s_afe) {
++        return ESP_OK;
++    }
++    if (!s_models) {
++        s_models = esp_srmodel_init("model");
++    }
++    if (!s_models) {
++        ESP_LOGE(TAG, "no models in the model partition");
++        return ESP_ERR_NOT_FOUND;
++    }
++    log_heap("before");
++    /* Without echo cancellation there is no playback reference to cancel, and
++     * a third, all-zero channel only gives the source separator something to
++     * lock onto: the two microphones alone are the honest input. */
++#if CONFIG_K151_AFE_AEC
++    const char *input_format = "MMR";
++#else
++    const char *input_format = "MM";
++#endif
++    s_cfg = afe_config_init(input_format, (srmodel_list_t *)s_models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
++    if (!s_cfg) {
++        ESP_LOGE(TAG, "afe_config_init failed");
++        return ESP_FAIL;
++    }
++    /* The difference between fitting and not: a couple of KB internal here
++     * against tens when the allocator balances the two. */
++    s_cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
++#if !CONFIG_K151_AFE_AEC
++    s_cfg->aec_init = false;
++#endif
++    s_cfg->wakenet_init = false;   /* the standalone WakeNet owns the wake word */
++    s_cfg->wakenet_model_name = NULL;
++    s_cfg->wakenet_model_name_2 = NULL;
++    /* No AGC: its gain creeps up during silence until the output clips, which
++     * hides the end of speech from the detector (the turn then runs to the 15 s
++     * cap) and leaves the transcript nothing to work with. Levels are handled
++     * where the note is recorded instead. */
++    s_cfg->agc_init = false;
++    const esp_afe_sr_iface_t *iface = esp_afe_handle_from_config(s_cfg);
++    if (!iface || !iface->create_from_config) {
++        ESP_LOGE(TAG, "no AFE interface");
++        return ESP_FAIL;
++    }
++    s_iface = iface;
++    s_afe = iface->create_from_config(s_cfg);
++    log_heap("after");
++    if (!s_afe) {
++        ESP_LOGE(TAG, "AFE could not be created");
++        return ESP_ERR_NO_MEM;
++    }
++    /* link.register builds a ~5 KB JSON in one internal block, and the tunnel
++     * cannot come up without it. An AFE that costs the radio is not worth
++     * having: give the memory back rather than ship a mute robot. */
++    size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
++    size_t block_int = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
++    size_t free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA);
++    if (free_int < AFE_KEEP_FREE_INT || block_int < AFE_KEEP_BLOCK_INT || free_dma < AFE_KEEP_FREE_DMA) {
++        ESP_LOGW(TAG, "dropped: %u B internal (%u B block), %u B DMA left for the radio",
++                 (unsigned)free_int, (unsigned)block_int, (unsigned)free_dma);
++        iface->destroy(s_afe);
++        s_afe = NULL;
++        afe_config_free(s_cfg);
++        s_cfg = NULL;
++        log_heap("released");
++        return ESP_ERR_NO_MEM;
++    }
++
++    s_feed_chunk = iface->get_feed_chunksize(s_afe);
++    s_feed_chan = iface->get_feed_channel_num ? iface->get_feed_channel_num(s_afe) : 2;
++    if (s_feed_chan < 2) {
++        s_feed_chan = 2;
++    }
++    s_feed = heap_caps_malloc((size_t)s_feed_chunk * s_feed_chan * sizeof(int16_t), MALLOC_CAP_SPIRAM);
++    s_in = xStreamBufferCreateWithCaps(AFE_IN_SAMPLES * sizeof(int16_t), sizeof(int16_t), MALLOC_CAP_SPIRAM);
++    s_out = xStreamBufferCreateWithCaps(AFE_OUT_SAMPLES * sizeof(int16_t), sizeof(int16_t), MALLOC_CAP_SPIRAM);
++#if CONFIG_K151_AFE_AEC
++    if (s_feed_chan > 2) {
++        s_ref = heap_caps_malloc(AFE_REF_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
++        s_ref_head = s_ref_tail = 0;
++    }
++#endif
++    if (!s_feed || !s_in || !s_out) {
++        ESP_LOGE(TAG, "no PSRAM for the AFE buffers");
++        iface->destroy(s_afe);
++        s_afe = NULL;
++        afe_config_free(s_cfg);
++        s_cfg = NULL;
++        return ESP_ERR_NO_MEM;
++    }
++    /* Core 0: the network lives there, but this task only copies samples and
++     * blocks between frames, while the voice task and the display keep core 1. */
++    if (xTaskCreatePinnedToCoreWithCaps(afe_task, "afe_proc", 4096, NULL, 5, NULL, 0,
++                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
++        ESP_LOGE(TAG, "no AFE task");
++        iface->destroy(s_afe);
++        s_afe = NULL;
++        return ESP_ERR_NO_MEM;
++    }
++    ESP_LOGI(TAG, "resident: %d Hz, feed %d ch x %d frames, fetch %d ch x %d frames",
++             iface->get_samp_rate(s_afe), s_feed_chan, s_feed_chunk,
++             iface->get_fetch_channel_num ? iface->get_fetch_channel_num(s_afe) : 1,
++             iface->get_fetch_chunksize(s_afe));
++    return ESP_OK;
++}
++
++/* feed() and fetch() live here, off the voice core. */
++static void afe_task(void *arg)
++{
++    (void)arg;
++    const size_t in_bytes = (size_t)s_feed_chunk * 2 * sizeof(int16_t);
++    for (;;) {
++        if (!s_afe || !s_iface) {
++            vTaskDelete(NULL);   /* the AFE was given back to the radio */
++            return;
++        }
++        size_t got = 0;
++        while (got < in_bytes) {
++            got += xStreamBufferReceive(s_in, (uint8_t *)s_feed + got, in_bytes - got, portMAX_DELAY);
++            if (!got) {
++                break;
++            }
++        }
++        if (got < in_bytes) {
++            continue;
++        }
++        /* s_feed holds interleaved L,R. With an echo canceller a third channel
++         * follows each pair; walk backwards so the wider layout never
++         * overwrites a pair that has not been moved yet. */
++        if (s_feed_chan > 2) {
++            for (int i = s_feed_chunk - 1; i >= 0; i--) {
++                int16_t l = s_feed[2 * i], r = s_feed[2 * i + 1];
++                int16_t ref = 0;
++#if CONFIG_K151_AFE_AEC
++                if (s_ref && esp_timer_get_time() - s_ref_last_us < 200000 && s_ref_tail != s_ref_head) {
++                    ref = s_ref[s_ref_tail];
++                    s_ref_tail = (s_ref_tail + 1) % AFE_REF_SAMPLES;
++                }
++#endif
++                s_feed[3 * i + 0] = l;
++                s_feed[3 * i + 1] = r;
++                s_feed[3 * i + 2] = ref;
++            }
++        }
++        s_iface->feed(s_afe, s_feed);
++        afe_fetch_result_t *r = s_iface->fetch ? s_iface->fetch(s_afe) : NULL;
++        if (r && r->ret_value == 0 && r->data && r->data_size > 0) {
++            xStreamBufferSend(s_out, r->data, (size_t)r->data_size, 0);
++        }
++    }
++}
++
++void *muse_afe_models(void)
++{
++    return s_models;
++}
++
++bool muse_afe_ready(void)
++{
++    return s_afe != NULL;
++}
++
++bool muse_afe_active(void)
++{
++    return s_afe != NULL && s_iface != NULL && s_in != NULL && s_out != NULL;
++}
++
++void muse_afe_feed(const int16_t *stereo, size_t frames)
++{
++    if (!muse_afe_active()) {
++        return;
++    }
++    /* Never blocks: if the processor falls behind, the oldest audio is not
++     * worth waiting for, and the microphone reader must keep its pace. */
++    xStreamBufferSend(s_in, stereo, frames * 2 * sizeof(int16_t), 0);
++}
++
++size_t muse_afe_take(int16_t *out, size_t want)
++{
++    if (!muse_afe_active()) {
++        return 0;
++    }
++    size_t n = xStreamBufferReceive(s_out, out, want * sizeof(int16_t), pdMS_TO_TICKS(20));
++    return n / sizeof(int16_t);
++}
++
++void muse_afe_ref(const int16_t *mono, size_t frames)
++{
++#if CONFIG_K151_AFE_AEC
++    if (!s_ref || !muse_afe_active()) {
++        return;
++    }
++    s_ref_last_us = esp_timer_get_time();
++    for (size_t i = 0; i < frames; i++) {
++        s_ref[s_ref_head] = mono[i];
++        s_ref_head = (s_ref_head + 1) % AFE_REF_SAMPLES;
++        if (s_ref_head == s_ref_tail) {   /* full: drop the oldest */
++            s_ref_tail = (s_ref_tail + 1) % AFE_REF_SAMPLES;
++        }
++    }
++#else
++    (void)mono;
++    (void)frames;
++#endif
++}
++
++void muse_afe_yield_to_radio(void)
++{
++    if (!s_afe) {
++        return;
++    }
++    const esp_afe_sr_iface_t *iface = esp_afe_handle_from_config(s_cfg);
++    ESP_LOGW(TAG, "released: the tunnel could not come up with it resident");
++    if (iface && iface->destroy) {
++        iface->destroy(s_afe);
++    }
++    s_afe = NULL;
++    afe_config_free(s_cfg);
++    s_cfg = NULL;
++    log_heap("released");
++}
++
++#else
++
++void *muse_afe_models(void) { return NULL; }
++bool muse_afe_ready(void) { return false; }
++bool muse_afe_active(void) { return false; }
++void muse_afe_feed(const int16_t *stereo, size_t frames) { (void)stereo; (void)frames; }
++size_t muse_afe_take(int16_t *out, size_t want) { (void)out; (void)want; return 0; }
++void muse_afe_ref(const int16_t *mono, size_t frames) { (void)mono; (void)frames; }
++void muse_afe_yield_to_radio(void) {}
++#include "esp_err.h"
++esp_err_t muse_afe_start(void) { return ESP_ERR_NOT_SUPPORTED; }
++
++#endif
+diff --git a/firmware/esp32/components/muse/muse_afe.h b/firmware/esp32/components/muse/muse_afe.h
+new file mode 100644
+index 0000000..c82a2ad
+--- /dev/null
++++ b/firmware/esp32/components/muse/muse_afe.h
+@@ -0,0 +1,36 @@
++/*
++ * The esp-sr AFE, resident (see muse_afe.c). Off unless K151_AFE_RESIDENT is
++ * set: it needs the wake word engine's esp-sr dependency.
++ */
++#pragma once
++
++#include <stdbool.h>
++
++#include "esp_err.h"
++
++/* Creates the AFE once and keeps it. ESP_OK, or the reason it failed. */
++esp_err_t muse_afe_start(void);
++
++/* True once the AFE is resident. */
++bool muse_afe_ready(void);
++
++/* True when the AFE is resident and can be fed. */
++bool muse_afe_active(void);
++
++/* Pushes one chunk of interleaved stereo mic frames through the AFE. The
++ * enhanced mono output appears in muse_afe_take(). */
++void muse_afe_feed(const int16_t *stereo, size_t frames);
++
++/* Pushes what the speaker is playing, for the echo canceller's reference.
++ * A no-op unless the AFE is resident and AEC is compiled in. */
++void muse_afe_ref(const int16_t *mono, size_t frames);
++
++/* Copies up to `want` enhanced mono samples; returns how many were available. */
++size_t muse_afe_take(int16_t *out, size_t want);
++
++/* Gives the AFE's memory back when the tunnel cannot come up with it resident. */
++void muse_afe_yield_to_radio(void);
++
++/* The model list it loaded, so the standalone WakeNet engine can share it
++ * instead of mapping the partition a second time. NULL if not started. */
++void *muse_afe_models(void);
+diff --git a/firmware/esp32/components/muse/muse_afe_probe.c b/firmware/esp32/components/muse/muse_afe_probe.c
+new file mode 100644
+index 0000000..c86de6c
+--- /dev/null
++++ b/firmware/esp32/components/muse/muse_afe_probe.c
+@@ -0,0 +1,152 @@
++/*
++ * Bench probe: can esp-sr 2.6.1's AFE be created on this board at all?
++ *
++ * It creates an AFE object from a stock config (MMR, SR, LOW_COST), once per
++ * console command, with the memory allocation strategy chosen by the caller,
++ * records every heap allocation it makes, and destroys the object again. It
++ * never touches the live voice path: no feed, no fetch, no wake engine change.
++ *
++ * Usage over the console (see muse_input.c):
++ *   >afe.try=psram      AFE_MEMORY_ALLOC_MORE_PSRAM
++ *   >afe.try=balance    AFE_MEMORY_ALLOC_INTERNAL_PSRAM_BALANCE
++ *   >afe.try=internal   AFE_MEMORY_ALLOC_MORE_INTERNAL
++ *
++ * Bluetooth is released first (it is only needed for phone setup), because that
++ * is the arrangement the probe is meant to test. A reboot brings Bluetooth back.
++ */
++#include "sdkconfig.h"
++
++#if CONFIG_K151_WAKE_WORD
++
++#include <stdio.h>
++#include <string.h>
++
++#include "esp_heap_caps.h"
++#if CONFIG_HEAP_TRACING
++#include "esp_heap_trace.h"
++#endif
++#include "esp_log.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "model_path.h"
++#include "esp_afe_config.h"
++#include "esp_afe_sr_iface.h"
++#include "esp_afe_sr_models.h"
++
++#include "esp_log.h"
++
++#include "muse_diag.h"
++#include "muse_mem.h"
++#include "muse_wake.h"
++
++#define TRACE_RECORDS 2048
++
++/* Weak: the BLE server lives in main, which this component must not depend on. */
++extern void ble_server_full_shutdown(void) __attribute__((weak));
++extern int esp_bt_controller_get_status(void) __attribute__((weak));
++
++static void heap_line(const char *tag)
++{
++    printf("@afe.heap %-14s int=%u/%u psram=%u/%u\n", tag,
++           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
++           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
++           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
++           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
++    fflush(stdout);
++}
++
++void muse_diag_afe_try(const char *mode_name)
++{
++    afe_memory_alloc_mode_t mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
++    if (!strcmp(mode_name, "balance")) {
++        mode = AFE_MEMORY_ALLOC_INTERNAL_PSRAM_BALANCE;
++    } else if (!strcmp(mode_name, "internal")) {
++        mode = AFE_MEMORY_ALLOC_MORE_INTERNAL;
++    }
++
++    /* The probe tests the arrangement we hope to ship: no Bluetooth. */
++    if (esp_bt_controller_get_status && esp_bt_controller_get_status() == 2 && ble_server_full_shutdown) {
++        printf("@afe.bluetooth released for the probe\n");
++        ble_server_full_shutdown();
++        vTaskDelay(pdMS_TO_TICKS(300));
++    }
++
++    srmodel_list_t *models = (srmodel_list_t *)muse_wake_models();
++    if (!models) {
++        models = esp_srmodel_init("model");
++    }
++    if (!models) {
++        printf("@afe.result no models\n");
++        return;
++    }
++
++#if CONFIG_HEAP_TRACING
++    /* The trace buffer lives in PSRAM so tracing does not itself eat the RAM
++     * it is measuring. */
++    heap_trace_record_t *records = heap_caps_malloc(TRACE_RECORDS * sizeof(heap_trace_record_t), MUSE_BIG_CAPS);
++    if (!records) {
++        printf("@afe.result no trace buffer\n");
++        return;
++    }
++    heap_trace_init_standalone(records, TRACE_RECORDS);
++#endif
++
++    /* The AFE logs a burst while it initialises, and this console drops what it
++     * cannot take: keep it quiet so the numbers below survive. */
++    esp_log_level_t saved_afe = esp_log_level_get("AFE");
++    esp_log_level_t saved_wn = esp_log_level_get("WAKENET10");
++    esp_log_level_t saved_cfg = esp_log_level_get("AFE_CONFIG");
++    esp_log_level_t saved_dl = esp_log_level_get("dl::Model");
++    esp_log_level_set("AFE", ESP_LOG_WARN);
++    esp_log_level_set("WAKENET10", ESP_LOG_WARN);
++    esp_log_level_set("AFE_CONFIG", ESP_LOG_WARN);
++    esp_log_level_set("dl::Model", ESP_LOG_WARN);
++
++    printf("@afe.begin mode=%d (%s)\n", (int)mode, mode_name);
++    fflush(stdout);
++    vTaskDelay(pdMS_TO_TICKS(100));
++    heap_line("before");
++
++#if CONFIG_HEAP_TRACING
++    heap_trace_start(HEAP_TRACE_ALL);
++#endif
++    afe_config_t *cfg = afe_config_init("MMR", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
++    if (cfg) {
++        cfg->memory_alloc_mode = mode;
++    }
++    const esp_afe_sr_iface_t *iface = cfg ? esp_afe_handle_from_config(cfg) : NULL;
++    esp_afe_sr_data_t *afe = (iface && iface->create_from_config) ? iface->create_from_config(cfg) : NULL;
++#if CONFIG_HEAP_TRACING
++    heap_trace_stop();
++#endif
++
++    heap_line("after create");
++    printf("@afe.result mode=%d cfg=%d iface=%d afe=%d\n", (int)mode, cfg != NULL, iface != NULL, afe != NULL);
++
++    /* Every allocation the AFE made, in order: address tells internal (0x3f...)
++     * from PSRAM (0x3c...), the size is what it asked for. */
++#if CONFIG_HEAP_TRACING
++    heap_trace_dump();
++#endif
++
++    if (afe && iface->destroy) {
++        iface->destroy(afe);
++        heap_line("after destroy");
++    }
++    if (cfg) {
++        afe_config_free(cfg);
++        heap_line("after free");
++    }
++#if CONFIG_HEAP_TRACING
++    heap_trace_init_standalone(NULL, 0);
++    free(records);
++#endif
++    esp_log_level_set("AFE", saved_afe);
++    esp_log_level_set("WAKENET10", saved_wn);
++    esp_log_level_set("AFE_CONFIG", saved_cfg);
++    esp_log_level_set("dl::Model", saved_dl);
++    printf("@afe.end\n");
++    fflush(stdout);
++}
++
++#endif
+diff --git a/firmware/esp32/components/muse/muse_app.c b/firmware/esp32/components/muse/muse_app.c
+index 9b14a81..25a5831 100644
+--- a/firmware/esp32/components/muse/muse_app.c
++++ b/firmware/esp32/components/muse/muse_app.c
+@@ -20,6 +20,11 @@
+ #include "freertos/queue.h"
+ #include "freertos/task.h"
+ 
++/* From main/muse_glue.c in a Muse build. */
++extern void muse_glue_ui_ready(void) __attribute__((weak));
++extern void muse_glue_radio_ready(void) __attribute__((weak));
++
++#include "muse_afe.h"
+ #include "muse_audio.h"
+ #include "muse_battery.h"
+ #include "muse_board.h"
+@@ -72,6 +77,23 @@ void muse_app_run(const muse_board_t *board)
+     muse_state_set_caption("WAKING UP...");
+     ESP_ERROR_CHECK(muse_ui_start());
+     ESP_LOGI(TAG, "UI built: free internal %u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
++    /* The display is up; the BLE stack may now take its internal RAM. Weak:
++     * a Link-only build has no glue. */
++    if (muse_glue_ui_ready) {
++        muse_glue_ui_ready();
++    }
++    /* And the AFE goes in here, before Wi-Fi and TLS fragment the internal
++     * heap: this is the only window where it fits. */
++#if CONFIG_K151_AFE_RESIDENT
++    if (muse_afe_start() == ESP_OK) {
++        ESP_LOGI(TAG, "AFE resident");
++    } else {
++        ESP_LOGE(TAG, "AFE not resident; continuing without it");
++    }
++#endif
++    if (muse_glue_radio_ready) {
++        muse_glue_radio_ready();
++    }
+ 
+     QueueHandle_t q = xQueueCreate(16, sizeof(muse_input_event_t));
+     ESP_ERROR_CHECK(muse_input_start(q));
+diff --git a/firmware/esp32/components/muse/muse_audio.c b/firmware/esp32/components/muse/muse_audio.c
+index 94e6059..4235f3d 100644
+--- a/firmware/esp32/components/muse/muse_audio.c
++++ b/firmware/esp32/components/muse/muse_audio.c
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include "muse_audio.h"
++#include "muse_afe.h"
+ 
+ #include <math.h>
+ #include <stdlib.h>
+@@ -249,6 +250,8 @@ void muse_audio_loopback_test(int volume)
+ 
+ static muse_audio_tap_t volatile s_tap;
+ static void *volatile s_tap_ctx;
++static muse_audio_tap_t volatile s_wake_tap;
++static void *volatile s_wake_tap_ctx;
+ 
+ void muse_audio_set_tap(muse_audio_tap_t tap, void *ctx)
+ {
+@@ -257,8 +260,60 @@ void muse_audio_set_tap(muse_audio_tap_t tap, void *ctx)
+     s_tap = tap;
+ }
+ 
++void muse_audio_set_wake_tap(muse_audio_tap_t tap, void *ctx)
++{
++    s_wake_tap = NULL;
++    s_wake_tap_ctx = ctx;
++    s_wake_tap = tap;
++}
++
+ esp_err_t muse_audio_read(int16_t *mono, size_t frames)
+ {
++#if CONFIG_K151_AFE_RESIDENT
++    /* With the AFE resident, everything downstream (VAD, the recording, the
++     * transcript) hears its enhanced mono output: two microphones beam-formed
++     * into one, with the noise suppressed. The tap above still gets the raw
++     * stereo, so direction finding keeps working. */
++    if (muse_afe_active()) {
++        int starve = 0;
++        while (frames) {
++            /* Read one microphone chunk every pass, whatever the AFE has ready:
++             * the wake word engine taps this read, and bursts with gaps in
++             * between make it miss the phrase entirely. */
++            if (esp_codec_dev_read(s_mic, s_in_stereo, MUSE_AUDIO_CHUNK * CHANNELS * sizeof(int16_t)) != ESP_CODEC_DEV_OK) {
++                return ESP_FAIL;
++            }
++            muse_audio_tap_t tap = s_tap;
++            if (tap) {
++                tap(s_in_stereo, MUSE_AUDIO_CHUNK, s_tap_ctx);
++            }
++            muse_audio_tap_t wake = s_wake_tap;
++            if (wake) {
++                wake(s_in_stereo, MUSE_AUDIO_CHUNK, s_wake_tap_ctx);
++            }
++            muse_afe_feed(s_in_stereo, MUSE_AUDIO_CHUNK);
++
++            size_t got = muse_afe_take(mono, frames);
++            if (got) {
++                /* No gain here: the separator's output is already close to the
++                 * detector's working range, and amplifying it (fixed or AGC)
++                 * pushed stray peaks into clipping, which the detector reads as
++                 * continuous loud noise and never ends the turn. */
++                mono += got;
++                frames -= got;
++                starve = 0;
++                continue;
++            }
++            if (starve++ > 48) {   /* ~1 s without output: fall back to raw */
++                ESP_LOGW(TAG, "AFE gave no audio; using the raw microphones");
++                break;
++            }
++        }
++        if (!frames) {
++            return ESP_OK;
++        }
++    }
++#endif
+     while (frames) {
+         size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;
+         if (esp_codec_dev_read(s_mic, s_in_stereo, n * CHANNELS * sizeof(int16_t)) != ESP_CODEC_DEV_OK) {
+@@ -268,6 +323,10 @@ esp_err_t muse_audio_read(int16_t *mono, size_t frames)
+         if (tap) {
+             tap(s_in_stereo, n, s_tap_ctx);
+         }
++        muse_audio_tap_t wake = s_wake_tap;
++        if (wake) {
++            wake(s_in_stereo, n, s_wake_tap_ctx);
++        }
+         for (size_t i = 0; i < n; i++) {
+             float x = muse_board->mic_slot < 0 ? 0.5f * ((float)s_in_stereo[2 * i] + (float)s_in_stereo[2 * i + 1])
+                                                : (float)s_in_stereo[2 * i + muse_board->mic_slot];
+@@ -293,6 +352,8 @@ esp_err_t muse_audio_write(const int16_t *mono, size_t frames)
+             s_out_stereo[2 * i] = mute ? 0 : mono[i];
+             s_out_stereo[2 * i + 1] = mute ? 0 : mono[i];
+         }
++        /* What goes to the speaker is also the echo canceller's reference. */
++        muse_afe_ref(mono, n);
+         if (esp_codec_dev_write(s_spk, s_out_stereo, n * CHANNELS * sizeof(int16_t)) != ESP_CODEC_DEV_OK) {
+             return ESP_FAIL;
+         }
+diff --git a/firmware/esp32/components/muse/muse_audio.h b/firmware/esp32/components/muse/muse_audio.h
+index ebffd6f..6470ccd 100644
+--- a/firmware/esp32/components/muse/muse_audio.h
++++ b/firmware/esp32/components/muse/muse_audio.h
+@@ -58,6 +58,10 @@ esp_err_t muse_audio_read(int16_t *mono, size_t frames);
+ typedef void (*muse_audio_tap_t)(const int16_t *stereo, size_t frames, void *ctx);
+ void muse_audio_set_tap(muse_audio_tap_t tap, void *ctx);
+ 
++/* A second tap, owned by the wake word engine: same frames, same task, and it
++ * does not take the one above away from direction finding or the recorder. */
++void muse_audio_set_wake_tap(muse_audio_tap_t tap, void *ctx);
++
+ /* Blocking write of `frames` mono samples to the speaker. */
+ esp_err_t muse_audio_write(const int16_t *mono, size_t frames);
+ 
+diff --git a/firmware/esp32/components/muse/muse_diag.c b/firmware/esp32/components/muse/muse_diag.c
+new file mode 100644
+index 0000000..e0b258f
+--- /dev/null
++++ b/firmware/esp32/components/muse/muse_diag.c
+@@ -0,0 +1,142 @@
++/*
++ * Read-only memory audit for the dual-microphone AFE question.
++ *
++ * Answers, on the real firmware and without changing it:
++ *   - how much internal RAM is free, how big the largest free block is, and
++ *     the worst water mark since boot (not just right now);
++ *   - how large a single internal allocation still succeeds, which is what an
++ *     AFE instance would need before it can even initialise;
++ *   - every task's stack headroom and whether that stack is internal or PSRAM.
++ *
++ * Nothing is kept: the probe allocations are freed before it returns.
++ */
++#include "muse_diag.h"
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "esp_heap_caps.h"
++#include "esp_memory_utils.h"
++#include "esp_system.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "sdkconfig.h"
++#if CONFIG_BT_ENABLED
++#include "esp_bt.h"
++#endif
++
++#include "muse_mem.h"
++
++static void line(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++
++static void line(const char *fmt, ...)
++{
++    va_list ap;
++    va_start(ap, fmt);
++    vprintf(fmt, ap);
++    va_end(ap);
++    printf("\n");
++    fflush(stdout);
++}
++
++static void heap(const char *name, uint32_t caps)
++{
++    multi_heap_info_t info;
++    heap_caps_get_info(&info, caps);
++    line("@mem.heap %s free=%u block=%u min=%u alloc=%u ablk=%u fblk=%u", name,
++         (unsigned)info.total_free_bytes, (unsigned)info.largest_free_block,
++         (unsigned)heap_caps_get_minimum_free_size(caps),
++         (unsigned)info.total_allocated_bytes, (unsigned)info.allocated_blocks,
++         (unsigned)info.free_blocks);
++}
++
++/* The largest single allocation still possible: AFE needs one shot of these. */
++static void probe(const char *name, uint32_t caps)
++{
++    static const size_t sizes[] = { 96 * 1024, 80 * 1024, 64 * 1024, 48 * 1024, 40 * 1024, 32 * 1024,
++                                    24 * 1024, 16 * 1024, 12 * 1024, 8 * 1024, 4 * 1024, 2 * 1024 };
++    size_t best = 0;
++    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
++        void *p = heap_caps_malloc(sizes[i], caps);
++        if (p) {
++            if (!best) {
++                best = sizes[i];   /* sizes descend: the first success is the largest */
++            }
++            free(p);
++        }
++    }
++    line("@mem.probe %s largest_single=%uK", name, (unsigned)(best / 1024));
++}
++
++static void tasks(void)
++{
++    UBaseType_t n = uxTaskGetNumberOfTasks() + 4;
++    TaskStatus_t *st = heap_caps_malloc(n * sizeof(TaskStatus_t), MUSE_BIG_CAPS);
++    if (!st) {
++        line("@mem.tasks none (no memory for the table)");
++        return;
++    }
++    n = uxTaskGetSystemState(st, n, NULL);
++    line("@mem.tasks count=%u", (unsigned)n);
++    for (UBaseType_t i = 0; i < n; i++) {
++        const char *where = st[i].pxStackBase ? (esp_ptr_internal(st[i].pxStackBase) ? "int" : "psram") : "?";
++        int core = -1;
++#if CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID
++        core = (int)st[i].xCoreID;
++#endif
++        line("@mem.task %-16s prio=%-2u core=%d hwm=%u stack=%s", st[i].pcTaskName, (unsigned)st[i].uxCurrentPriority,
++             core, (unsigned)st[i].usStackHighWaterMark, where);
++    }
++    free(st);
++}
++
++/* Weak: the BLE server lives in main, which this component must not depend on. */
++extern void ble_server_full_shutdown(void) __attribute__((weak));
++
++/*
++ * Releases the whole Bluetooth stack (NimBLE host + controller + memory pools)
++ * and prints the heap on both sides, so the reclaim is measured and not assumed.
++ * BLE setup needs a reboot afterwards; nothing else uses Bluetooth.
++ */
++void muse_diag_bt_off(void)
++{
++    line("@bt.before");
++    heap("int", MALLOC_CAP_INTERNAL);
++    heap("dma", MALLOC_CAP_DMA);
++    heap("psram", MALLOC_CAP_SPIRAM);
++    probe("int", MALLOC_CAP_INTERNAL);
++    if (!ble_server_full_shutdown) {
++        line("@bt.none no BLE server linked");
++        return;
++    }
++    ble_server_full_shutdown();
++    vTaskDelay(pdMS_TO_TICKS(300));
++    line("@bt.after");
++    heap("int", MALLOC_CAP_INTERNAL);
++    heap("dma", MALLOC_CAP_DMA);
++    heap("psram", MALLOC_CAP_SPIRAM);
++    probe("int", MALLOC_CAP_INTERNAL);
++#if CONFIG_BT_ENABLED
++    line("@bt.status controller=%d", (int)esp_bt_controller_get_status());
++#endif
++}
++
++void muse_diag_mem(void)
++{
++    line("@mem.begin heap=%u min=%u", (unsigned)esp_get_free_heap_size(),
++         (unsigned)esp_get_minimum_free_heap_size());
++    line("@mem.total int=%uK dma=%uK psram=%uK", (unsigned)(heap_caps_get_total_size(MALLOC_CAP_INTERNAL) / 1024),
++         (unsigned)(heap_caps_get_total_size(MALLOC_CAP_DMA) / 1024),
++         (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024));
++    heap("int", MALLOC_CAP_INTERNAL);
++    heap("dma", MALLOC_CAP_DMA);
++    heap("psram", MALLOC_CAP_SPIRAM);
++    probe("int", MALLOC_CAP_INTERNAL);
++    probe("dma", MALLOC_CAP_DMA);
++#if CONFIG_BT_ENABLED
++    line("@mem.bt controller=%d", (int)esp_bt_controller_get_status());
++#endif
++    tasks();
++    line("@mem.end");
++}
+diff --git a/firmware/esp32/components/muse/muse_diag.h b/firmware/esp32/components/muse/muse_diag.h
+new file mode 100644
+index 0000000..72cda5d
+--- /dev/null
++++ b/firmware/esp32/components/muse/muse_diag.h
+@@ -0,0 +1,25 @@
++/*
++ * Read-only diagnostics over the console. Nothing here changes behaviour.
++ */
++#pragma once
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Prints the internal/PSRAM/DMA water marks, the largest single allocation
++ * still possible, and the task stacks. Triggered by the console command "mem". */
++void muse_diag_mem(void);
++
++/* Releases the Bluetooth stack and prints the heap before and after.
++ * Triggered by the console command "bt.off"; BLE setup needs a reboot later. */
++void muse_diag_bt_off(void);
++
++/* Bench probe: creates an AFE object with the given memory strategy
++ * ("psram", "balance" or "internal"), traces its allocations, destroys it.
++ * Triggered by the console command "afe.try=<mode>". Needs CONFIG_K151_WAKE_WORD. */
++void muse_diag_afe_try(const char *mode_name);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/firmware/esp32/components/muse/muse_input.c b/firmware/esp32/components/muse/muse_input.c
+index 53682d5..b7b6aa2 100644
+--- a/firmware/esp32/components/muse/muse_input.c
++++ b/firmware/esp32/components/muse/muse_input.c
+@@ -36,6 +36,7 @@
+ #include "muse_board.h"
+ #include "muse_chat.h"
+ #include "muse_console.h"
++#include "muse_diag.h"
+ #include "muse_link.h"
+ #include "muse_mem.h"
+ #include "muse_menu.h"
+@@ -606,6 +607,20 @@ static bool console_command(char *line, bool whole)
+         fflush(stdout);
+         return true;
+     }
++    if (!strcmp(line, "mem")) {
++        muse_diag_mem();   /* read-only: water marks, largest block, stacks */
++        return true;
++    }
++    if (!strcmp(line, "bt.off")) {
++        muse_diag_bt_off();   /* bench: release Bluetooth, print both sides */
++        return true;
++    }
++#if CONFIG_K151_WAKE_WORD
++    if (!strncmp(line, "afe.try=", 8)) {
++        muse_diag_afe_try(line + 8);   /* bench: create/destroy an AFE, traced */
++        return true;
++    }
++#endif
+     if (!strcmp(line, "nap")) {
+         muse_state_set_as_if_battery(true);
+         set_asleep(true, "serial");
+@@ -616,6 +631,12 @@ static bool console_command(char *line, bool whole)
+         set_face(line + 5);
+         return true;
+     }
++    if (!strncmp(line, "say=", 4)) {
++        muse_voice_request_say(line + 4);
++        printf("@say {\"queued\":true}\n");
++        fflush(stdout);
++        return true;
++    }
+     if (strncmp(line, "chat", 4) != 0) {
+         return muse_board->console && muse_board->console(line);
+     }
+@@ -687,11 +708,11 @@ static void serial_task(void *arg)
+ esp_err_t muse_input_start(QueueHandle_t queue)
+ {
+     s_queue = queue;
+-    if (xTaskCreate(input_task, "muse_input", 4096, NULL, 6, &s_input) != pdPASS) {
++    if (xTaskCreate(input_task, "muse_input", 2560, NULL, 6, &s_input) != pdPASS) {
+         return ESP_FAIL;
+     }
+     /* Bench-test and setup console; the input still works if it can't start. */
+-    xTaskCreate(serial_task, "muse_serial", 3584, NULL, 5, NULL);
++    xTaskCreate(serial_task, "muse_serial", 2048, NULL, 5, NULL);
+     return ESP_OK;
+ }
+ 
+@@ -726,6 +747,34 @@ void muse_input_hands_free_tap(void)
+     post(MUSE_PTT_DOWN, false);   /* no release follows: hands-free turns end on silence */
+ }
+ 
++void muse_input_wake_tap(void)
++{
++    /* The wake word is itself the wake event: no hands-free setting to check
++     * and no sleeping screen to refuse. As with a hands-free tap, no release
++     * follows, so the turn ends on silence. */
++    if (muse_link_state() != MUSE_LINK_ONLINE) {
++        /* Not a turn, but not silence either: a wake word that does nothing at
++         * all reads as a dead robot. Wake the screen and say what is wrong. */
++        ESP_LOGW(TAG, "wake word: Muse is %s", muse_link_state_name(muse_link_state()));
++        if (muse_state_asleep()) {
++            muse_state_set_asleep(false);
++        }
++        muse_state_set_mode(MUSE_MODE_IDLE);
++        muse_state_set_caption("MUSE OFFLINE");
++        return;
++    }
++    if (esp_timer_get_time() < s_taps_held_until_us) {
++        ESP_LOGW(TAG, "wake word ignored: taps held");
++        return;
++    }
++    if (muse_state_asleep()) {
++        ESP_LOGI(TAG, "wake word wakes the screen");
++        muse_state_set_asleep(false);
++    }
++    ESP_LOGI(TAG, "wake word starts a turn");
++    post(MUSE_PTT_DOWN, false);
++}
++
+ void muse_input_request_power_off(void)
+ {
+     s_power_off_requested = true;
+diff --git a/firmware/esp32/components/muse/muse_input.h b/firmware/esp32/components/muse/muse_input.h
+index 6c90092..59d2d6b 100644
+--- a/firmware/esp32/components/muse/muse_input.h
++++ b/firmware/esp32/components/muse/muse_input.h
+@@ -63,6 +63,10 @@ void muse_input_touch_talk(bool down);
+  */
+ void muse_input_hands_free_tap(void);
+ 
++/* A wake word was heard: same as the hands-free tap, but it does not require the
++ * hands-free setting and it wakes a sleeping screen. Safe from any task. */
++void muse_input_wake_tap(void);
++
+ /* Hands-free taps do nothing for the next `ms` (a tap that only stopped something, e.g. a dance). */
+ void muse_input_hold_taps(int ms);
+ 
+diff --git a/firmware/esp32/components/muse/muse_tts.c b/firmware/esp32/components/muse/muse_tts.c
+index d86e248..0e6bea0 100644
+--- a/firmware/esp32/components/muse/muse_tts.c
++++ b/firmware/esp32/components/muse/muse_tts.c
+@@ -40,7 +40,7 @@
+ 
+ static const char *TAG = "muse_tts";
+ 
+-#define URL "https://api.minimaxi.com/v1/t2a_v2"
++#define URL CONFIG_MUSE_TTS_MINIMAX_URL
+ #define MODEL CONFIG_MUSE_TTS_MINIMAX_MODEL
+ #define DEFAULT_VOICE CONFIG_MUSE_TTS_MINIMAX_VOICE
+ #define VOLUME 1.4      /* the app's level for the device speaker */
+@@ -76,7 +76,7 @@ static void load(void)
+         nvs_close(h);
+     }
+     if (!key_saved) {
+-        strlcpy(s_key, CONFIG_MUSE_TTS_MINIMAX_KEY, sizeof(s_key));
++        strlcpy(s_key, CONFIG_MUSE_TTS_MINIMAX_KEY[0] ? CONFIG_MUSE_TTS_MINIMAX_KEY : "mac-free-edge-tts", sizeof(s_key));
+     }
+ }
+ 
+@@ -177,7 +177,7 @@ static bool fetch(void)
+         .url = URL,
+         .method = HTTP_METHOD_POST,
+         .crt_bundle_attach = esp_crt_bundle_attach,
+-        .timeout_ms = 30000,
++        .timeout_ms = 60000,   /* a local server buffers the whole reply: long text is slow */
+         .buffer_size = 2048,
+     };
+     esp_http_client_handle_t c = esp_http_client_init(&cfg);
+@@ -314,13 +314,14 @@ bool muse_tts_start(const char *text)
+             return false;
+         }
+     }
+-    muse_tts_cancel();
+-    for (int i = 0; s_busy && i < 300; i++) {   /* the last fetch winding down */
+-        vTaskDelay(pdMS_TO_TICKS(10));
+-    }
++    /* Never block the chat task here: the fetch for the previous message can
++     * sit in the HTTP client for as long as the server takes to generate. A
++     * caller that gets false with muse_tts_busy() set keeps the message queued
++     * and retries, instead of falling back to a silent caption. */
+     if (s_busy) {
+         return false;
+     }
++    muse_tts_cancel();
+     xStreamBufferReset(s_mp3);
+     /* Cut a long reply at a character boundary, never inside a UTF-8 sequence:
+      * MiniMax rejects the request if its JSON isn't valid UTF-8. */
+@@ -351,6 +352,13 @@ muse_tts_state_t muse_tts_state(void)
+     return s_state;
+ }
+ 
++bool muse_tts_busy(void)
++{
++    /* True while a fetch runs, including the part where the server is still
++     * generating and nothing has been read yet. */
++    return s_busy;
++}
++
+ void muse_tts_cancel(void)
+ {
+     if (s_busy) {
+diff --git a/firmware/esp32/components/muse/muse_voice.c b/firmware/esp32/components/muse/muse_voice.c
+index e94df97..155717f 100644
+--- a/firmware/esp32/components/muse/muse_voice.c
++++ b/firmware/esp32/components/muse/muse_voice.c
+@@ -36,6 +36,7 @@
+ #include "muse_mem.h"
+ #include "muse_settings.h"
+ #include "muse_state.h"
++#include "muse_wake.h"
+ #include "muse_vad.h"
+ #include "muse_wifi.h"
+ 
+@@ -74,6 +75,7 @@ static volatile float s_monitor_db = -100.0f;
+ static volatile bool s_chirp;
+ static volatile bool s_loopback;
+ static volatile bool s_mp3test;
++static char * volatile s_say_text;
+ static muse_voice_job_t s_job;   /* a board audio job waiting to run */
+ 
+ /*
+@@ -998,6 +1000,28 @@ static void voice_task(void *arg)
+                 free(pcm);
+                 pre_reset();
+             }
++            char *say = __atomic_exchange_n(&s_say_text, NULL, __ATOMIC_ACQ_REL);
++            if (say) {
++                muse_state_poke();
++                muse_state_set_mode(MUSE_MODE_THINKING);
++                muse_state_set_caption("%s", say);
++                int16_t *pcm = NULL;
++                size_t n = muse_hatch_tts_say(say, &pcm);
++                if (pcm && n > 0) {
++                    muse_state_set_mode(MUSE_MODE_SPEAKING);
++                    for (size_t i = 0; i < n; i += MUSE_AUDIO_CHUNK) {
++                        size_t chunk = n - i < MUSE_AUDIO_CHUNK ? n - i : MUSE_AUDIO_CHUNK;
++                        muse_state_set_level(muse_audio_level(pcm + i, chunk));
++                        muse_audio_write(pcm + i, chunk);
++                    }
++                    muse_state_set_level(0);
++                    muse_state_make_happy();
++                }
++                free(pcm);
++                free(say);
++                go_idle("");
++                pre_reset();
++            }
+             if (s_loopback) {
+                 s_loopback = false;
+                 muse_audio_loopback_test(muse_settings_volume());
+@@ -1160,6 +1184,11 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
+                                         MUSE_BIG_CAPS) != pdPASS) {
+         return ESP_ERR_NO_MEM;
+     }
++#if CONFIG_K151_WAKE_WORD
++    /* After the display and the codecs: the engine's buffers must not take the
++     * internal RAM LVGL needs for its DMA buffers. */
++    muse_wake_start_later();
++#endif
+     return ESP_OK;
+ }
+ 
+@@ -1192,6 +1221,14 @@ void muse_voice_request_mp3test(void)
+     muse_state_nudge();
+ }
+ 
++void muse_voice_request_say(const char *text)
++{
++    char *copy = text ? strdup(text) : NULL;
++    char *old = __atomic_exchange_n(&s_say_text, copy, __ATOMIC_ACQ_REL);
++    free(old);
++    muse_state_nudge();
++}
++
+ bool muse_voice_resting(void)
+ {
+     return s_resting;
+diff --git a/firmware/esp32/components/muse/muse_voice.h b/firmware/esp32/components/muse/muse_voice.h
+index 594b4fe..4494fba 100644
+--- a/firmware/esp32/components/muse/muse_voice.h
++++ b/firmware/esp32/components/muse/muse_voice.h
+@@ -76,6 +76,7 @@ void muse_voice_request_loopback(void);
+ 
+ /* Bench test: decodes and plays a built-in MP3 reply. */
+ void muse_voice_request_mp3test(void);
++void muse_voice_request_say(const char *text);
+ 
+ /* Asleep with nothing to play: codecs off, Wi-Fi dozing. */
+ bool muse_voice_resting(void);
+diff --git a/firmware/esp32/components/muse/muse_wake.c b/firmware/esp32/components/muse/muse_wake.c
+new file mode 100644
+index 0000000..79dda7e
+--- /dev/null
++++ b/firmware/esp32/components/muse/muse_wake.c
+@@ -0,0 +1,271 @@
++/* Copyright 2026 the StackChan K151 Muse port authors. SPDX-License-Identifier: Apache-2.0 */
++#include "sdkconfig.h"
++#include "muse_wake.h"
++#include "muse_afe.h"
++
++#if CONFIG_K151_WAKE_WORD
++
++#include <math.h>
++#include <string.h>
++
++#include "freertos/FreeRTOS.h"
++#include "freertos/stream_buffer.h"
++#include "freertos/task.h"
++#include "esp_heap_caps.h"
++#include "esp_log.h"
++#include "esp_timer.h"
++#include "esp_wn_iface.h"
++#include "esp_wn_models.h"
++#include "model_path.h"
++
++#include "muse_audio.h"
++#include "muse_input.h"
++#include "muse_link.h"
++
++#define WAKE_RING_SAMPLES 8000   /* 500 ms of 16 kHz mono */
++/* The codec runs at 30 dB of mic gain, which puts speech at about -8 dBFS and
++ * clips the peaks. The recogniser wants roughly -20 dBFS, so drop one bit per
++ * step here before the ring. */
++#define WAKE_GAIN_SHIFT 1   /* -6 dB: speech peaks ~-20 dBFS at 30 dB mic gain */
++#define WAKE_RATE 16000
++
++static const char *TAG = "muse_wake";
++
++static srmodel_list_t *s_models;
++static const esp_wn_iface_t *s_iface;
++static model_iface_data_t *s_data;
++static StreamBufferHandle_t s_ring;
++static int s_chunk;
++static volatile bool s_ready;
++static volatile uint32_t s_hits;
++
++/* Runs on the voice task: copy and return, never block. */
++static void wake_tap(const int16_t *stereo, size_t frames, void *ctx)
++{
++    static int16_t mono[MUSE_AUDIO_CHUNK];
++    static int64_t last_us;
++    static int64_t sum_l, sum_r;
++    static int counted;
++
++    if (!s_ready || !s_ring) {
++        return;
++    }
++    if (frames > MUSE_AUDIO_CHUNK) {
++        frames = MUSE_AUDIO_CHUNK;
++    }
++    for (size_t i = 0; i < frames; i++) {
++        int32_t l = stereo[2 * i], r = stereo[2 * i + 1];
++        /* Both mics, after the gain shift: one slot alone was near silent on
++         * this unit, so measure which one carries speech before choosing. */
++        mono[i] = (int16_t)(((l + r) / 2) >> WAKE_GAIN_SHIFT);
++        sum_l += l * l;
++        sum_r += r * r;
++    }
++    counted += (int)frames;
++    int64_t now = esp_timer_get_time();
++    if (now - last_us > 5000000) {
++        float l = sqrtf((float)sum_l / (float)counted), r = sqrtf((float)sum_r / (float)counted);
++        ESP_LOGI(TAG, "mics: L %.1f dBFS, R %.1f dBFS", 20.0f * log10f(l / 32768.0f + 1e-9f),
++                 20.0f * log10f(r / 32768.0f + 1e-9f));
++        last_us = now;
++        sum_l = sum_r = 0;
++        counted = 0;
++    }
++    xStreamBufferSend(s_ring, mono, frames * sizeof(int16_t), 0);
++}
++
++static void wake_task(void *arg)
++{
++    (void)arg;
++    const size_t bytes = (size_t)s_chunk * sizeof(int16_t);
++    int16_t *buf = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
++    if (!buf) {
++        ESP_LOGE(TAG, "no PSRAM for the feed buffer");
++        vTaskDelete(NULL);
++        return;
++    }
++    int64_t last_level_us = 0;
++    int64_t last_hit_us = 0;
++    float loudest_db = -120.0f;
++    int loudest_peak = 0;
++    for (;;) {
++        size_t got = 0;
++        while (got < bytes) {
++            got += xStreamBufferReceive(s_ring, (uint8_t *)buf + got, bytes - got, portMAX_DELAY);
++        }
++        int64_t sum = 0;
++        int peak = 0;
++        for (int i = 0; i < s_chunk; i++) {
++            sum += (int32_t)buf[i] * buf[i];
++            int mag = buf[i] < 0 ? -buf[i] : buf[i];
++            peak = mag > peak ? mag : peak;
++        }
++        float db = 20.0f * log10f(sqrtf((float)sum / (float)s_chunk) / 32768.0f + 1e-9f);
++        loudest_db = db > loudest_db ? db : loudest_db;
++        loudest_peak = peak > loudest_peak ? peak : loudest_peak;
++
++        int64_t now = esp_timer_get_time();
++        if (now - last_level_us > 5000000) {
++            last_level_us = now;
++            ESP_LOGI(TAG, "feed: loudest %.1f dBFS, peak %d", loudest_db, loudest_peak);
++            loudest_db = -120.0f;
++            loudest_peak = 0;
++        }
++
++        wakenet_state_t state = s_iface->detect(s_data, buf);
++        if (state == WAKENET_DETECTED && now - last_hit_us > 1500000) {
++            last_hit_us = now;   /* one word lasts about a second; count it once */
++            s_hits++;
++            char *word = s_iface->get_word_name(s_data, 1);   /* WakeNet10 words start at 1 */
++            ESP_LOGI(TAG, "wake word heard: %s (%.1f dBFS, peak %d)", word ? word : "?", db, peak);
++            s_iface->clean(s_data);
++            muse_input_wake_tap();   /* start a hands-free conversation turn */
++        }
++    }
++}
++
++static void log_mem(const char *step)
++{
++    ESP_LOGI(TAG, "%s: int %u (block %u), dma %u (block %u), psram %u", step,
++             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
++             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
++             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
++             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
++             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
++}
++
++void muse_wake_start(void)
++{
++    if (s_ready) {
++        return;
++    }
++    log_mem("before model init");
++    s_models = muse_afe_models();
++    if (!s_models) {
++        s_models = esp_srmodel_init("model");
++    }
++    log_mem("after model init");
++    if (!s_models) {
++        ESP_LOGW(TAG, "no model partition, or it holds no model");
++        return;
++    }
++    ESP_LOGI(TAG, "model partition holds %d model(s)", s_models->num);
++    for (int i = 0; i < s_models->num; i++) {
++        ESP_LOGI(TAG, "  %s", s_models->model_name[i]);
++    }
++
++    char *name = esp_srmodel_filter(s_models, ESP_WN_PREFIX, NULL);
++    if (!name) {
++        ESP_LOGE(TAG, "no wake word model in the partition");
++        return;
++    }
++    s_iface = esp_wn_handle_from_name(name);
++    if (!s_iface) {
++        ESP_LOGE(TAG, "no interface for %s", name);
++        return;
++    }
++    s_data = s_iface->create(name, DET_MODE_95);
++    log_mem("after wakenet create");
++    if (!s_data) {
++        ESP_LOGE(TAG, "could not create %s", name);
++        return;
++    }
++    if (s_iface->get_samp_rate(s_data) != WAKE_RATE || s_iface->get_channel_num(s_data) != 1) {
++        ESP_LOGE(TAG, "%s is not 16 kHz mono", name);
++        s_iface->destroy(s_data);
++        s_data = NULL;
++        return;
++    }
++    s_chunk = s_iface->get_samp_chunksize(s_data);
++    ESP_LOGI(TAG, "%s ready: %d samples per detect (%d ms), heap %u internal / %u psram",
++             name, s_chunk, s_chunk * 1000 / WAKE_RATE,
++             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
++             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
++    int words = s_iface->get_word_num ? s_iface->get_word_num(s_data) : 0;
++    for (int i = 1; i <= words; i++) {
++        ESP_LOGI(TAG, "word %d: %s", i, s_iface->get_word_name(s_data, i));
++    }
++
++    /* Both in PSRAM: internal RAM is what the display's DMA buffers need, and
++     * there is only a handful of KB of it left once the model is up. */
++    uint8_t *ring_mem = heap_caps_malloc(WAKE_RING_SAMPLES * sizeof(int16_t) + 1, MALLOC_CAP_SPIRAM);
++    StaticStreamBuffer_t *ring_ctl = heap_caps_malloc(sizeof(*ring_ctl), MALLOC_CAP_SPIRAM);
++    if (!ring_mem || !ring_ctl) {
++        ESP_LOGE(TAG, "no PSRAM for the ring buffer");
++        return;
++    }
++    s_ring = xStreamBufferCreateStatic(WAKE_RING_SAMPLES * sizeof(int16_t), sizeof(int16_t), ring_mem, ring_ctl);
++    if (!s_ring) {
++        ESP_LOGE(TAG, "no ring buffer");
++        return;
++    }
++    if (xTaskCreatePinnedToCoreWithCaps(wake_task, "muse_wake", 4096, NULL, 4, NULL, 1, MALLOC_CAP_SPIRAM) != pdPASS) {
++        ESP_LOGE(TAG, "no wake task");
++        return;
++    }
++    muse_audio_set_wake_tap(wake_tap, NULL);
++    s_ready = true;
++}
++
++static void wake_init_task(void *arg)
++{
++    (void)arg;
++    muse_wake_start();
++    vTaskDelete(NULL);
++}
++
++static void wake_waiter(void *arg)
++{
++    (void)arg;
++    /*
++     * Wait for the link for as long as it takes. Bounding this was a mistake:
++     * a boot that landed while Wi-Fi or Muse was slow (a reboot in the night,
++     * a router still waking up) left the wake word off for the rest of that
++     * boot, and nothing on screen said so. The wait is still for registration
++     * to be done, because the model and the microphones cost the internal RAM
++     * that link.register needs.
++     */
++    for (unsigned i = 1;; i++) {
++        if (muse_link_state() == MUSE_LINK_ONLINE) {
++            ESP_LOGI(TAG, "Muse online: starting the wake word engine");
++            /* A fresh task for the model: it needs an internal stack (the cache
++             * freeze in esp_srmodel_init asserts on that), and this waiter's
++             * stack must stay small so link.register keeps its room. */
++            if (xTaskCreatePinnedToCore(wake_init_task, "wake_init", 4096, NULL, 3, NULL, 1) != pdPASS) {
++                ESP_LOGE(TAG, "no init task");
++            }
++            vTaskDelete(NULL);
++            return;
++        }
++        if (i % 120 == 0) {   /* a minute at 500 ms */
++            ESP_LOGW(TAG, "Muse is %s; wake word still waiting",
++                     muse_link_state_name(muse_link_state()));
++        }
++        vTaskDelay(pdMS_TO_TICKS(500));
++    }
++}
++
++void muse_wake_start_later(void)
++{
++    if (s_ready) {
++        return;
++    }
++    /* Small internal stack: it only polls the link state. */
++    if (xTaskCreatePinnedToCore(wake_waiter, "wake_wait", 2048, NULL, 3, NULL, 1) != pdPASS) {
++        ESP_LOGE(TAG, "no waiter task");
++    }
++}
++
++uint32_t muse_wake_hits(void) { return s_hits; }
++
++void *muse_wake_models(void) { return s_models; }
++
++#else
++
++uint32_t muse_wake_hits(void) { return 0; }
++
++void muse_wake_start(void) {}
++void muse_wake_start_later(void) {}
++void *muse_wake_models(void) { return NULL; }
++
++#endif
+diff --git a/firmware/esp32/components/muse/muse_wake.h b/firmware/esp32/components/muse/muse_wake.h
+new file mode 100644
+index 0000000..756f20e
+--- /dev/null
++++ b/firmware/esp32/components/muse/muse_wake.h
+@@ -0,0 +1,22 @@
++/* Copyright 2026 the StackChan K151 Muse port authors. SPDX-License-Identifier: Apache-2.0 */
++#pragma once
++
++#include <stdint.h>
++
++/* Starts the wake word engine: loads the model from the "model" partition,
++ * feeds it microphone frames, and starts a conversation turn when the wake word
++ * is heard. Safe to call once, after audio is up. */
++void muse_wake_start(void);
++
++/* Waits for Muse to be online, then starts the engine. The model's working
++ * buffers cost about 17 KB of internal RAM, and link.register needs that room
++ * to build its 5 KB payload, so the engine must not take it first. */
++void muse_wake_start_later(void);
++
++/* Wake words heard since boot (after the debounce). */
++uint32_t muse_wake_hits(void);
++
++/* The model list from the "model" partition, for other esp-sr users (the AFE
++ * probe). void* so this header need not pull in model_path.h. NULL until the
++ * engine has started. */
++void *muse_wake_models(void);
+diff --git a/firmware/esp32/main/Kconfig.projbuild b/firmware/esp32/main/Kconfig.projbuild
+index d0fb1d8..ecb4c8b 100644
+--- a/firmware/esp32/main/Kconfig.projbuild
++++ b/firmware/esp32/main/Kconfig.projbuild
+@@ -50,6 +50,30 @@ menu "ESP32 Device SDK"
+             Password for CONFIG_HOMEHUB_WIFI_SSID. Ignored when the SSID
+             override is empty.
+ 
++    config HOMEHUB_STATIC_IP
++        string "Static IPv4 address (empty = DHCP)"
++        default ""
++        help
++            Pin the device instead of taking a DHCP lease. Needed on networks
++            whose DHCP hands out a gateway that comes and goes (a laptop running
++            the proxy, for instance): set this to a free address in the LAN and
++            the gateway and DNS below to the router that must carry the traffic.
++            Empty keeps DHCP.
++
++    config HOMEHUB_STATIC_GATEWAY
++        string "Static IPv4 gateway"
++        default ""
++        help
++            Router for CONFIG_HOMEHUB_STATIC_IP. Ignored when that is empty.
++
++    config HOMEHUB_STATIC_DNS
++        string "Static DNS server"
++        default ""
++        help
++            DNS server for CONFIG_HOMEHUB_STATIC_IP. Point it at the same
++            router: a resolver reached through the wrong gateway answers with
++            addresses that cannot be routed back.
++
+     config HOMEHUB_TOKEN_REFRESH_INTERVAL_DAYS
+         int "Proactive device token refresh interval (days, 0 = disabled)"
+         range 0 365
+diff --git a/firmware/esp32/main/app.c b/firmware/esp32/main/app.c
+index a8f8344..9f93268 100644
+--- a/firmware/esp32/main/app.c
++++ b/firmware/esp32/main/app.c
+@@ -54,6 +54,18 @@
+ #include "noise_control.h"
+ #include "image_fetch.h"
+ #include "noise_tunnel.h"
++#if CONFIG_K151_WAKE_WORD
++#include "muse_wake.h"
++#endif
++#if CONFIG_MUSE_ENABLED
++#include "muse_state.h"
++#endif
++#if CONFIG_K151_AFE_RESIDENT
++#include "muse_afe.h"
++#endif
++#if CONFIG_MUSE_ENABLED
++#include "muse_voice.h"
++#endif
+ #include "led_status.h"
+ #include "button.h"
+ #include "tunnel_netif.h"
+@@ -102,8 +114,8 @@ static const char *HEARTBEAT_TAG = "link.heartbeat";
+ #define TOKEN_PERIODIC_REFRESH_INTERVAL_US \
+     ((int64_t)CONFIG_HOMEHUB_TOKEN_REFRESH_INTERVAL_DAYS \
+      * 24LL * 60LL * 60LL * 1000000LL)
+-#define PAIRING_CONFIRM_WINDOW_MS   (60 * 1000)
+-#define PAIRING_CONFIRMED_IDLE_TIMEOUT_MS (120 * 1000)
++#define PAIRING_CONFIRM_WINDOW_MS   (180 * 1000)
++#define PAIRING_CONFIRMED_IDLE_TIMEOUT_MS (600 * 1000)
+ 
+ // OTA rollback: how long a freshly-installed (PENDING_VERIFY) image has to
+ // reach the authenticated control WebSocket before the bootloader reverts it.
+@@ -2090,9 +2102,21 @@ static void start_ble_setup_server_if_needed(void) {
+         .on_client_disconnected = on_client_disconnected,
+         .on_pairing_client_finished = on_pairing_client_finished,
+     };
++#if CONFIG_K151_BENCH_NO_BT
++    /* Bench only: Bluetooth is not started at all, so the ~39 KB it holds stay
++     * free for the display's DMA buffers. Used by the AFE probe build. */
++    ESP_LOGW(TAG, "bench build: Bluetooth not started");
++#else
++    /* The display needs ~17 KB of internal RAM for its DMA buffers and aborts
++     * without it. BLE holds ~39 KB, so it must come up after LVGL, not before:
++     * the UI sets this bit once it is built. */
++    if (!muse_glue_wait_ui(15000)) {
++        ESP_LOGW(TAG, "UI not up after 15 s; starting BLE anyway");
++    }
+     ble_server_start(identity_ble_name(), &cb);
+     s_ble_started = true;
+     heap_snapshot("after ble_start");
++#endif
+ }
+ 
+ static void open_setup_window(const char *reason) {
+@@ -2647,10 +2671,12 @@ void app_run(void) {
+         ui_set_ble("off");
+         ESP_LOGI(TAG, "BLE setup disabled; long-press reset to pair again");
+ #if CONFIG_MUSE_ENABLED && CONFIG_SPIRAM
+-        // Muse may turn on its BLE companion later. The controller needs a
+-        // 30 KB internal block that TLS and the VM session leave fragmented,
+-        // so bring the stack up now; it stays silent until advertising is on.
+-        start_ble_setup_server_if_needed();
++        // A provisioned device does not bring Bluetooth up at all: the stack
++        // holds ~39 KB of internal RAM, and the wake/AFE path needs it. Pairing
++        // and unpairing start it on demand (open_setup_window below), and a
++        // released stack is only restored by a reboot, which the unpair path
++        // arranges.
++        ESP_LOGI(TAG, "BLE released: not started on a provisioned device");
+ #endif
+     }
+ 
+@@ -2685,6 +2711,16 @@ void app_run(void) {
+         ESP_LOGI(TAG, "found provisioned creds in NVS, reconnecting (first: %s)", wifi_ssid);
+     }
+ 
++#if CONFIG_MUSE_ENABLED
++    // The AFE is created right after the display for the same reason: it needs
++    // a large internal block, and the radio's buffers fragment the heap. Wait
++    // for it, but never for long: a device without Wi-Fi is worse than one
++    // without an AFE.
++    if (!muse_glue_wait_radio(15000)) {
++        ESP_LOGW(TAG, "AFE not up after 15 s; connecting the radio anyway");
++    }
++#endif
++
+     if (wifi_ssid) {
+         ui_set_status("wifi_connecting");
+         led_status_set_state(LED_STATE_WIFI_CONNECTING);
+@@ -2745,6 +2781,9 @@ void app_run(void) {
+ #endif
+ 
+     // Heartbeat: log full state every 5 s so we can tell where we're stuck.
++    // Why this boot began, first: a panic, a watchdog or a brownout in the
++    // night is otherwise invisible (there is no coredump partition).
++    ESP_LOGI(HEARTBEAT_TAG, "boot: reset reason %d", (int)esp_reset_reason());
+     stack_monitor_t stack = STACK_MONITOR_INIT;
+     tunnel_stats_t prev_tun = {0};
+     while (1) {
+@@ -2792,6 +2831,22 @@ void app_run(void) {
+             }
+         }
+ 
++#if CONFIG_K151_AFE_RESIDENT
++        /* An AFE that keeps the tunnel down is worse than no AFE: if the tunnel
++         * has not come up after two heartbeats with it resident, let it go. */
++        static int afe_wait;
++        if (muse_afe_ready() && !noise_tunnel_is_connected()) {
++            /* The tunnel takes a while on a cold boot (measured 10-16 s); only
++             * an established control session with no tunnel means the AFE is
++             * really in the way. */
++            if (++afe_wait >= 6) {
++                afe_wait = 0;
++                muse_afe_yield_to_radio();
++            }
++        } else {
++            afe_wait = 0;
++        }
++#endif
+         size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+         size_t largest_int = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+         size_t free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA);
+@@ -2799,9 +2854,24 @@ void app_run(void) {
+         size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+         tunnel_stats_t tun;
+         tunnel_netif_get_stats(&tun);
++        uint32_t kb_gated = 0, kb_timeouts = 0, wake_hits = 0;
++        noise_tunnel_get_health(&kb_gated, &kb_timeouts);
++#if CONFIG_K151_WAKE_WORD
++        wake_hits = muse_wake_hits();
++#endif
++        // Power and sleep, so a morning that "did nothing" can be told from a
++        // wake engine that is simply waiting for the link.
++        const char *power = "?";
++        int resting = -1, asleep = -1;
++#if CONFIG_MUSE_ENABLED
++        power = muse_state_on_battery() ? "bat" : "usb";
++        resting = muse_voice_resting() ? 1 : 0;
++        asleep = muse_state_asleep() ? 1 : 0;
++#endif
+         ESP_LOGI(HEARTBEAT_TAG, "hb t=%llds setup=%s wifi=%s ws=%s raw=%s ble=%s "
+-                       "int=%uK/%uK dma=%uK/%uK psram=%uK "
+-                       "tun rx+%lu/%luB tx+%lu/%luB drop+%lu",
++                       "int=%uK/%uK min=%uK dma=%uK/%uK psram=%uK/%uK "
++                       "tun rx+%lu/%luB tx+%lu/%luB drop+%lu "
++                       "wk=%lu kb=%lu/%lu pwr=%s rest=%d zz=%d",
+                  esp_timer_get_time() / 1000000,
+                  s_setup_stage,
+                  wifi_mgr_is_connected() ? "up" : "down",
+@@ -2810,14 +2880,20 @@ void app_run(void) {
+                  s_ui_ble,
+                  (unsigned)(free_int / 1024),
+                  (unsigned)(largest_int / 1024),
++                 (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                  (unsigned)(free_dma / 1024),
+                  (unsigned)(largest_dma / 1024),
+                  (unsigned)(free_psram / 1024),
++                 (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                  (unsigned long)(tun.rx_pkts - prev_tun.rx_pkts),
+                  (unsigned long)(tun.rx_bytes - prev_tun.rx_bytes),
+                  (unsigned long)(tun.tx_pkts - prev_tun.tx_pkts),
+                  (unsigned long)(tun.tx_bytes - prev_tun.tx_bytes),
+-                 (unsigned long)(tun.tx_dropped - prev_tun.tx_dropped));
++                 (unsigned long)(tun.tx_dropped - prev_tun.tx_dropped),
++                 (unsigned long)wake_hits,
++                 (unsigned long)kb_gated,
++                 (unsigned long)kb_timeouts,
++                 power, resting, asleep);
+         prev_tun = tun;
+         stack_monitor_record(&stack);
+ #if CONFIG_MUSE_ENABLED
+diff --git a/firmware/esp32/main/ble_server.c b/firmware/esp32/main/ble_server.c
+index fd77035..39f7ae8 100644
+--- a/firmware/esp32/main/ble_server.c
++++ b/firmware/esp32/main/ble_server.c
+@@ -30,6 +30,7 @@
+ #include "esp_app_desc.h"
+ #include "mbedtls/platform_util.h"
+ #include "freertos/FreeRTOS.h"
++#include "freertos/idf_additions.h"
+ #include "freertos/task.h"
+ #include "freertos/semphr.h"
+ 
+@@ -465,7 +466,12 @@ static void dispatch_command_ex(const uint8_t *data, size_t len, bool decrypted)
+             // stack during TLS handshake than v5's 3.x (~2 KB more peak).
+             a->session_generation = link_pairing_mark_provisioning_active();
+             if (a->session_generation == 0
+-                || xTaskCreate(provision_task, "prov", 8192, a, 5, NULL) != pdPASS) {
++                /* The stack goes in PSRAM: with the display and Bluetooth up,
++                 * the internal heap has no 8 KB block, and a failed creation
++                 * here surfaced to the app as error_operation_in_progress (the
++                 * "can't connect" the phone shows while provisioning). */
++                || xTaskCreateWithCaps(provision_task, "prov", 8192, a, 5, NULL,
++                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+                 uint32_t generation = a->session_generation;
+                 secure_free_str(a->ssid);
+                 secure_free_str(a->password);
+diff --git a/firmware/esp32/main/muse_glue.c b/firmware/esp32/main/muse_glue.c
+index e1ae994..f935d3b 100644
+--- a/firmware/esp32/main/muse_glue.c
++++ b/firmware/esp32/main/muse_glue.c
+@@ -49,6 +49,8 @@ static const char *TAG = "link.muse";
+ #define BIT_STORAGE     BIT0    // NVS + identity ready: Muse may start
+ #define BIT_LINK        BIT1    // boot connect done: Muse may use the radios
+ #define BIT_MUSE        BIT2    // Muse settings loaded
++#define BIT_UI_READY    BIT3    // display and LVGL are up: BLE may take its RAM
++#define BIT_RADIO_READY BIT4    // the AFE is resident: Wi-Fi may connect
+ 
+ #define KEEP_WIFI       BIT0    // wifi on/off or network changed
+ #define KEEP_BLE        BIT1    // phone setup setting changed
+@@ -629,7 +631,7 @@ void muse_glue_start(void) {
+     // Pinned to the UI core, so the display's SPI interrupt, set up in it,
+     // lands beside the task that sends to the display (muse_lcd_bands.h).
+     if (xTaskCreatePinnedToCore(boot_task, "muse_boot", 8192, NULL, 5, NULL, MUSE_UI_CORE) != pdPASS
+-        || xTaskCreate(keeper_task, "muse_keep", 6144, NULL, 4, &s_keeper) != pdPASS) {
++        || xTaskCreate(keeper_task, "muse_keep", 3584, NULL, 4, &s_keeper) != pdPASS) {
+         ESP_LOGE(TAG, "failed to start Muse tasks");
+     }
+ }
+@@ -639,6 +641,34 @@ void muse_glue_storage_ready(void) {
+     xEventGroupSetBits(s_ready, BIT_STORAGE);
+ }
+ 
++void muse_glue_ui_ready(void) {
++    if (s_ready) {
++        xEventGroupSetBits(s_ready, BIT_UI_READY);
++    }
++}
++
++void muse_glue_radio_ready(void) {
++    if (s_ready) {
++        xEventGroupSetBits(s_ready, BIT_RADIO_READY);
++    }
++}
++
++bool muse_glue_wait_radio(uint32_t ms) {
++    if (!s_ready) {
++        return false;
++    }
++    EventBits_t bits = xEventGroupWaitBits(s_ready, BIT_RADIO_READY, pdFALSE, pdTRUE, pdMS_TO_TICKS(ms));
++    return (bits & BIT_RADIO_READY) != 0;
++}
++
++bool muse_glue_wait_ui(uint32_t ms) {
++    if (!s_ready) {
++        return false;
++    }
++    EventBits_t bits = xEventGroupWaitBits(s_ready, BIT_UI_READY, pdFALSE, pdTRUE, pdMS_TO_TICKS(ms));
++    return (bits & BIT_UI_READY) != 0;
++}
++
+ void muse_glue_link_ready(void) {
+     xEventGroupSetBits(s_ready, BIT_LINK);
+ }
+diff --git a/firmware/esp32/main/muse_glue.h b/firmware/esp32/main/muse_glue.h
+index fe5598d..2f978d0 100644
+--- a/firmware/esp32/main/muse_glue.h
++++ b/firmware/esp32/main/muse_glue.h
+@@ -28,6 +28,16 @@ void muse_glue_start(void);
+ void muse_glue_storage_ready(void);
+ // From app_run(): boot Wi-Fi/VM connect is done; Muse may drive the radios.
+ void muse_glue_link_ready(void);
++// From the Muse UI task: the display and LVGL are up. The BLE stack waits for
++// this, because its ~39 KB of internal RAM would otherwise starve LVGL's DMA
++// buffers during boot (the display aborts when it cannot create its task).
++void muse_glue_ui_ready(void);
++// From app_run(): waits for the UI above, true if it came up in time.
++bool muse_glue_wait_ui(uint32_t ms);
++// From the Muse boot task: everything that needs the internal heap before the
++// radio (the AFE) is in place; Wi-Fi may connect now.
++void muse_glue_radio_ready(void);
++bool muse_glue_wait_radio(uint32_t ms);
+ // The LED backend for Muse builds: Link's status, shown on the display.
+ void muse_glue_led_state(led_state_t state);
+ 
+diff --git a/firmware/esp32/main/wifi_mgr.c b/firmware/esp32/main/wifi_mgr.c
+index 7a5de97..e0247f1 100644
+--- a/firmware/esp32/main/wifi_mgr.c
++++ b/firmware/esp32/main/wifi_mgr.c
+@@ -23,6 +23,10 @@
+ #include "esp_wifi.h"
+ #include "esp_event.h"
+ #include "esp_netif.h"
++#include "esp_netif_net_stack.h"
++#include "lwip/netif.h"
++#include "lwip/dns.h"
++#include "lwip/inet.h"
+ #include "esp_log.h"
+ #include "soc/soc_caps.h"
+ #include "freertos/FreeRTOS.h"
+@@ -187,6 +191,10 @@ static void event_handler(void *arg, esp_event_base_t base,
+     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
+         ESP_LOGI(TAG, "got IP " IPSTR, IP2STR(&ev->ip_info.ip));
++        /* The gateway and DNS come from DHCP or from the static settings
++         * above. A build once forced them to a laptop running the proxy on
++         * this subnet, which made every reboot of that laptop cut the device
++         * off and defeated a pinned gateway; the router does that job now. */
+         s_retry = 0;
+         s_keep_connected = true;
+         s_reconnect_backoff_ms = RECONNECT_BACKOFF_MIN_MS;  // reset on success
+@@ -204,6 +212,28 @@ void wifi_mgr_init(void) {
+     ESP_ERROR_CHECK(esp_event_loop_create_default());
+     s_sta_netif = esp_netif_create_default_wifi_sta();
+ 
++    /* Optional static address: on a network whose DHCP pushes a gateway that is
++     * not always there (a laptop running the proxy), the device pins itself to
++     * the router that must carry its traffic. Empty config = plain DHCP. */
++    if (CONFIG_HOMEHUB_STATIC_IP[0]) {
++        esp_netif_dhcpc_stop(s_sta_netif);   /* fine if it never started */
++        esp_netif_ip_info_t ip = {0};
++        ip.ip.addr = esp_ip4addr_aton(CONFIG_HOMEHUB_STATIC_IP);
++        ip.netmask.addr = esp_ip4addr_aton("255.255.255.0");
++        if (CONFIG_HOMEHUB_STATIC_GATEWAY[0]) {
++            ip.gw.addr = esp_ip4addr_aton(CONFIG_HOMEHUB_STATIC_GATEWAY);
++        }
++        ESP_ERROR_CHECK(esp_netif_set_ip_info(s_sta_netif, &ip));
++        if (CONFIG_HOMEHUB_STATIC_DNS[0]) {
++            esp_netif_dns_info_t dns = {0};
++            dns.ip.type = ESP_IPADDR_TYPE_V4;
++            dns.ip.u_addr.ip4.addr = esp_ip4addr_aton(CONFIG_HOMEHUB_STATIC_DNS);
++            esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns);
++        }
++        ESP_LOGI(TAG, "static IP %s/%s gw %s dns %s", CONFIG_HOMEHUB_STATIC_IP, "24",
++                 CONFIG_HOMEHUB_STATIC_GATEWAY, CONFIG_HOMEHUB_STATIC_DNS);
++    }
++
+     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+ 
+diff --git a/firmware/esp32/partitions_muse.csv b/firmware/esp32/partitions_muse.csv
+index ed4e0c8..91caeff 100644
+--- a/firmware/esp32/partitions_muse.csv
++++ b/firmware/esp32/partitions_muse.csv
+@@ -25,3 +25,4 @@ ota_0,     app,  ota_0,   0x20000,  4M,
+ ota_1,     app,  ota_1,   0x420000, 4M,
+ prod_data, data, 0x40,    0x820000, 0x1000,
+ prod_bak,  data, 0x41,    0x821000, 0x1000,
++model,     data, 0x40,    0x830000, 2M,
