@@ -22,8 +22,8 @@ to the existing port, not a replacement.
   released once the device is provisioned, giving back ~39 KB of internal RAM.
   Re-pairing is a button press away.
 - **Configurable TTS endpoint**, so replies can be spoken by a local TTS server
-  instead of the cloud (the default here is a Mac serving
-  `/v1/t2a_v2`; see `docs/WAKE_WORD.md`).
+  instead of the cloud. The shipped default is a placeholder — point it at your
+  own MiniMax-T2A-v2-compatible server.
 
 ## What it is not
 
